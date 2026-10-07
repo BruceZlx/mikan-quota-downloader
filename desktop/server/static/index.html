@@ -149,10 +149,31 @@ tr:last-child td{border-bottom:0}
   padding:12px 14px;text-align:center;box-shadow:inset 0 1px 0 rgba(255,255,255,.7)}
 .stat b{display:block;font-size:22px}
 .stat span{font-size:13px;color:var(--mut)}
+
+/* 顶部持续状态栏：检测/整理等长操作期间一直显示，直到完成 */
+#status-bar{position:fixed;top:0;left:212px;right:0;z-index:50;display:none;align-items:center;gap:10px;
+  padding:9px 18px;font-size:14px;color:var(--fg);
+  background:rgba(255,255,255,.8);-webkit-backdrop-filter:var(--blur);backdrop-filter:var(--blur);
+  border-bottom:1px solid var(--line);box-shadow:0 6px 20px rgba(31,41,55,.1)}
+#status-bar .spin{width:14px;height:14px;border-radius:50%;flex:none;
+  border:2px solid rgba(37,99,235,.25);border-top-color:var(--acc);animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+#status-bar.err{color:var(--bad)}
+#status-bar.err .spin{display:none}
+#status-bar .ok-mark{color:var(--ok);font-weight:600;display:none}
+#status-bar.done .spin{display:none}
+#status-bar.done .ok-mark{display:inline}
+
+/* 任务按订阅分组的表头行 */
+tr.group td{background:rgba(255,255,255,.62);font-weight:600;cursor:pointer;user-select:none;
+  border-bottom:1px solid rgba(255,255,255,.8)}
+tr.group .chev{display:inline-block;width:16px;color:var(--mut)}
+tr.group .cnt{color:var(--mut);font-weight:400;font-size:13px}
 </style>
 </head>
 <body>
 <div class="bg"></div>
+<div id="status-bar"><span class="spin"></span><span class="ok-mark">✓</span><span id="status-text"></span><span class="mut" id="status-elapsed"></span></div>
 
 <aside class="side">
   <div class="side-brand">Anime Downloader</div>
@@ -196,8 +217,19 @@ tr:last-child td{border-bottom:0}
       <div class="row"><span id="gate" class="badge"></span>
         <span class="hint" style="margin:0">上限调整在 左侧「⚙ 设置」</span></div>
     </div>
+    <div class="card" id="pending-card" style="display:none">
+      <h2>待确认新集 <span class="mut" style="font-weight:400;font-size:13px">逐集确认模式：点「同意」后才开始下载；「拒绝」的本季不再提示</span></h2>
+      <table>
+        <thead><tr><th style="width:24%">订阅</th><th>集数</th><th style="width:170px">操作</th></tr></thead>
+        <tbody id="pending"></tbody>
+      </table>
+      <div class="row">
+        <button class="small" onclick="approveAllPending()">全部放行</button>
+        <span class="hint" style="margin:0">不想逐集点可一次全部放行；关闭此模式在「⚙ 设置」</span>
+      </div>
+    </div>
     <div class="card">
-      <h2>下载任务</h2>
+      <h2>下载任务 <span class="mut" style="font-weight:400;font-size:13px">点订阅行可展开 / 收起该番的任务</span></h2>
       <div class="stats" style="margin-bottom:12px">
         <div class="stat"><b id="sum-downloading">0</b><span>下载中</span></div>
         <div class="stat"><b id="sum-seeding">0</b><span>做种中</span></div>
@@ -283,6 +315,15 @@ tr:last-child td{border-bottom:0}
       <div class="hint">0 = 不限。立即生效并回写 config.yaml；用量仪表盘见「主页」。</div>
     </div>
     <div class="card">
+      <h2>新集确认</h2>
+      <div class="row" style="margin-top:0">
+        <label><input type="checkbox" id="confirm-eps" style="width:auto"> 订阅新集下载前需逐集确认（推荐）</label>
+        <button class="ghost" onclick="saveConfirmEps()">保存</button>
+      </div>
+      <div class="hint">开启后：订阅发现的新集先进入「主页 → 待确认新集」，点「同意」才开始下载，「拒绝」本季不再提示。
+        关闭则回到"发现即自动下载"。</div>
+    </div>
+    <div class="card">
       <h2>默认下载目录</h2>
       <div class="row" style="margin-top:0"><input id="save-path" placeholder="绝对路径，如 /Movies/Bangumi 或 D:\Bangumi" style="width:100%"></div>
       <div class="row"><button onclick="savePath()">保存默认下载目录</button><span class="mut" id="save-path-now"></span></div>
@@ -350,6 +391,36 @@ document.querySelectorAll('.side a[data-page]').forEach(a =>
 
 function toast(msg){ const t=$('toast'); t.textContent=msg; t.style.display='block'; setTimeout(()=>t.style.display='none', 3600); }
 async function api(path, opts){ const r = await fetch(path, opts); if(!r.ok){ let m=await r.text(); throw new Error(r.status+' '+m);} return r.status===200? r.json(): null; }
+const esc = s => String(s??'').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+/* ── 持续状态栏：长操作（检测/整理/放行）期间一直显示，直到完成才消失 ── */
+let statusTimer = null;
+function statusShow(label){
+  const b = $('status-bar');
+  b.classList.remove('err','done');
+  b.style.display = 'flex';
+  $('status-text').textContent = label;
+  $('status-elapsed').textContent = '';
+  const t0 = Date.now();
+  clearInterval(statusTimer);
+  statusTimer = setInterval(()=>{ $('status-elapsed').textContent = Math.round((Date.now()-t0)/1000)+'s'; }, 500);
+}
+function statusEnd(ok, text){
+  clearInterval(statusTimer);
+  const b = $('status-bar');
+  b.classList.toggle('err', !ok);
+  b.classList.toggle('done', ok);
+  $('status-text').textContent = text;
+  setTimeout(()=>{ b.style.display='none'; }, ok? 1500 : 6000);
+}
+async function withStatus(label, fn){
+  statusShow(label);
+  let result, err=null;
+  try{ result = await fn(); }catch(e){ err = e; }
+  if(err){ statusEnd(false, label+' 失败：'+err.message); throw err; }
+  statusEnd(true, label+' ✓ 完成');
+  return result;
+}
 
 async function poll(){
   try{
@@ -367,16 +438,36 @@ async function poll(){
     gate.className = 'badge ' + (quota.seed_gate_closed?'bad':'ok');
     if(document.activeElement.id!=='dl-limit' && $('dl-limit').value==='') $('dl-limit').value = (quota.download_limit/GiB).toFixed(1).replace(/\.0$/,'');
     if(document.activeElement.id!=='up-limit' && $('up-limit').value==='') $('up-limit').value = quota.seed_limit? (quota.seed_limit/GiB).toFixed(1).replace(/\.0$/,''):'0';
-    const tasks = await api('/api/tasks');
+    const data = await api('/api/tasks');
+    const tasks = data.tasks || [];
+    lastSubs = data.subs || {};
+    lastTasks = tasks;
     const counts = {downloading:0, seeding:0, paused:0, completed:0, checking:0, failed:0};
     tasks.forEach(t => { if(counts[t.state] !== undefined) counts[t.state]++; });
     $('sum-downloading').textContent = counts.downloading + counts.checking;
     $('sum-seeding').textContent = counts.seeding;
     $('sum-queued').textContent = counts.paused;
     $('sum-completed').textContent = counts.completed + counts.failed;
-    $('tasks').innerHTML = tasks.length? tasks.map(t=>`
-      <tr><td>${t.name}</td>
-      <td><span class="badge ${STATE_CLS[t.state]||''}">${STATE_TXT[t.state]||t.state}</span></td>
+    renderTasks();
+    const pd = await api('/api/subscriptions/pending');
+    renderPending(pd.pending || []);
+  }catch(e){ $('engine-info').textContent = '服务异常'; }
+}
+
+/* ── 任务表：按订阅分组，组头可点击展开/收起（记忆在 localStorage） ── */
+let lastTasks = [], lastSubs = {};
+const MANUAL_GROUP = '手动添加 / 未关联';
+function collapsedGroups(){ try{ return new Set(JSON.parse(localStorage.getItem('mqd-collapsed')||'[]')); }catch(e){ return new Set(); } }
+function toggleGroup(key){
+  const set = collapsedGroups();
+  set.has(key)? set.delete(key) : set.add(key);
+  localStorage.setItem('mqd-collapsed', JSON.stringify([...set]));
+  renderTasks();
+}
+function taskRow(t){
+  const heldMark = t.held? ' <span class="badge warn" title="被侧栏下载/做种总开关按住">总开关</span>' : '';
+  return `<tr><td>${esc(t.name)}</td>
+      <td><span class="badge ${STATE_CLS[t.state]||''}">${STATE_TXT[t.state]||t.state}</span>${heldMark}</td>
       <td>${t.size? (100*t.done/t.size).toFixed(1):0}%</td>
       <td>${fmtSpeed(t.rate_down)}</td>
       <td>${fmtSpeed(t.rate_up||0)}</td>
@@ -385,8 +476,49 @@ async function poll(){
         <button class="small ghost" onclick="taskOp('${t.sha}','pause')">暂停</button>
         <button class="small ghost" onclick="taskOp('${t.sha}','resume')">恢复</button>
         <button class="small ghost" onclick="taskDel('${t.sha}')">删除</button>
-      </td></tr>`).join('') : '<tr><td colspan="7" class="mut">暂无任务：去「订阅」添加番剧，或在「下载」粘贴磁力链接</td></tr>';
-  }catch(e){ $('engine-info').textContent = '服务异常'; }
+      </td></tr>`;
+}
+function renderTasks(){
+  const collapsed = collapsedGroups();
+  const groups = [];  // [{key, tasks}]，按任务出现顺序
+  const byKey = {};
+  lastTasks.forEach(t => {
+    const key = (lastSubs[t.sha] && lastSubs[t.sha].title) || MANUAL_GROUP;
+    if(!byKey[key]){ byKey[key] = []; groups.push({key, tasks: byKey[key]}); }
+    byKey[key].push(t);
+  });
+  if(!groups.length){
+    $('tasks').innerHTML = '<tr><td colspan="7" class="mut">暂无任务：去「订阅」添加番剧，或在「下载」粘贴磁力链接</td></tr>';
+    return;
+  }
+  $('tasks').innerHTML = groups.map(g => {
+    const open = !collapsed.has(g.key);
+    const head = `<tr class="group" onclick="toggleGroup('${esc(g.key).replace(/'/g,'&#39;')}')">
+      <td colspan="7"><span class="chev">${open? '▾':'▸'}</span> ${esc(g.key)}
+        <span class="cnt">${g.tasks.length} 个任务</span></td></tr>`;
+    return head + (open? g.tasks.map(taskRow).join('') : '');
+  }).join('');
+}
+
+/* ── 待确认新集（逐集确认模式） ── */
+function renderPending(pending){
+  $('pending-card').style.display = pending.length? 'block' : 'none';
+  if(!pending.length) return;
+  $('pending').innerHTML = pending.map(p => `
+    <tr><td class="mut">${esc(p.sub_title)}</td><td>${esc(p.title)}</td>
+    <td>
+      <button class="small" onclick="approvePending(${p.id})">同意</button>
+      <button class="small ghost" onclick="rejectPending(${p.id})">拒绝</button>
+    </td></tr>`).join('');
+}
+async function approvePending(id){ try{ await api(`/api/subscriptions/pending/${id}/approve`, {method:'POST'}); poll(); }catch(e){ toast(e.message); } }
+async function rejectPending(id){ try{ await api(`/api/subscriptions/pending/${id}/reject`, {method:'POST'}); poll(); }catch(e){ toast(e.message); } }
+async function approveAllPending(){
+  try{
+    const r = await withStatus('正在放行全部待确认新集…', () => api('/api/subscriptions/pending/approve-all', {method:'POST'}));
+    toast(`已放行 ${r.approved} 集${r.failed? `，失败 ${r.failed} 集`:''}`);
+    poll();
+  }catch(e){}
 }
 async function taskOp(sha, op){ try{ await api(`/api/tasks/${sha}/${op}`, {method:'POST'}); poll(); }catch(e){ toast(e.message);} }
 async function taskDel(sha){ try{ await api(`/api/tasks/${sha}`, {method:'DELETE'}); poll(); }catch(e){ toast(e.message);} }
@@ -443,24 +575,26 @@ async function loadSubs(){
 }
 async function addSub(){
   try{
-    const r = await api('/api/subscriptions', {method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({rss_url: $('sub-url').value.trim(), title: $('sub-title').value.trim(), save_path: $('sub-path').value.trim()})});
+    const r = await withStatus('正在添加订阅并拉取集数…', () => api('/api/subscriptions', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({rss_url: $('sub-url').value.trim(), title: $('sub-title').value.trim(), save_path: $('sub-path').value.trim()})}));
     $('sub-url').value = ''; $('sub-title').value = '';
     toast(r.blocked? '订阅已保存，但被 Cloudflare 拦截：请按手册 §4 导入 Cookie（无需登录账号）'
-      : `订阅成功「${r.title||r.rss_url}」：共 ${r.total} 条，新开始 ${r.started} 条，排队 ${r.queued} 条`);
+      : `订阅成功「${r.title||r.rss_url}」：共 ${r.total} 条，新开始 ${r.started} 条，排队 ${r.queued} 条`
+        + (r.pending? `，待确认 ${r.pending} 条（主页「待确认新集」里放行）`:''));
     loadSubs(); poll();
-  }catch(e){ toast(e.message); }
+  }catch(e){}
 }
 async function checkSub(id){
-  try{ const r = await api(`/api/subscriptions/${id}/check`, {method:'POST'});
+  try{ const r = await withStatus('正在检查订阅更新…', () => api(`/api/subscriptions/${id}/check`, {method:'POST'}));
     if(r.blocked){ toast('被 Cloudflare 拦截：请导入 Cookie（无需登录）'); }
     else{
-      let m = `检查完成：新开始 ${r.started} 条，排队 ${r.queued} 条，恢复丢失 ${r.restored||0} 条`;
+      let m = `检查完成：新开始 ${r.started} 条，排队 ${r.queued} 条，恢复丢失 ${r.restored||0} 条`
+        + (r.pending? `，待确认 ${r.pending} 条`:'');
       if(r.errors && r.errors.length) m += `；失败 ${r.errors.length} 条（可能镜像缺该种子，下轮自动换镜像重试）`;
       toast(m);
     }
     loadSubs(); poll();
-  }catch(e){ toast(e.message); }
+  }catch(e){}
 }
 async function toggleSub(id, enabled){
   try{ await api(`/api/subscriptions/${id}/toggle`, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({enabled})}); loadSubs(); }
@@ -483,7 +617,13 @@ async function restoreSub(id){
   try{ await api(`/api/subscriptions/${id}/restore`, {method:'POST'}); toast('订阅已恢复，将继续自动追更'); loadSubs(); }
   catch(e){ toast(e.message); }
 }
-async function checkAllSubs(){ try{ await api('/api/subscriptions/check-all', {method:'POST'}); toast('已触发全部检查'); loadSubs(); poll(); }catch(e){ toast(e.message); } }
+async function checkAllSubs(){
+  try{
+    const r = await withStatus('正在检查全部订阅…', () => api('/api/subscriptions/check-all', {method:'POST'}));
+    toast(`检查完成：${r.checked} 个订阅，新开始 ${r.started} 条${r.blocked? `，${r.blocked} 个被 Cloudflare 拦截（导入 Cookie 后重试）`:''}`);
+    loadSubs(); poll();
+  }catch(e){}
+}
 async function saveInterval(){
   try{ const r = await api('/api/settings/interval', {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({minutes: parseInt($('sub-interval').value)||20})});
@@ -495,7 +635,15 @@ async function loadSettings(){
     const s = await api('/api/settings');
     $('save-path-now').textContent = s.save_path ? '当前：'+s.save_path : '尚未设置默认目录';
     if(document.activeElement.id !== 'save-path') $('save-path').value = s.save_path || '';
+    $('confirm-eps').checked = !!s.confirm_new_episodes;
   }catch(e){ $('save-path-now').textContent = '设置读取失败'; }
+}
+async function saveConfirmEps(){
+  try{
+    const r = await api('/api/settings/confirm-episodes', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({enabled: $('confirm-eps').checked})});
+    toast(r.confirm_new_episodes? '已开启逐集确认：新集会在主页「待确认新集」等放行' : '已关闭逐集确认：新集发现即自动下载');
+  }catch(e){ toast(e.message); }
 }
 async function savePath(){
   try{
@@ -550,17 +698,17 @@ async function addMirror(){
 }
 async function delMirror(id){ try{ await api(`/api/mirrors/${id}`, {method:'DELETE'}); loadMirrors(); }catch(e){ toast(e.message); } }
 async function checkMirrors(){
-  try{ const r = await api('/api/mirrors/check', {method:'POST'});
+  try{ const r = await withStatus('正在检测镜像站可达性…', () => api('/api/mirrors/check', {method:'POST'}));
     toast(`检测完成：${r.available}/${r.checked} 个可用`); loadMirrors();
-  }catch(e){ toast(e.message); }
+  }catch(e){}
 }
 async function organizeSubs(){
   try{
-    const r = await api('/api/subscriptions/organize', {method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({fetch_titles: true})});
+    const r = await withStatus('正在整理订阅与文件…', () => api('/api/subscriptions/organize', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({fetch_titles: true})}));
     toast(`整理完成：补全名称 ${r.renamed}，设定目录 ${r.paths_set}，搬迁文件 ${r.moved}`);
     loadSubs(); poll();
-  }catch(e){ toast(e.message); }
+  }catch(e){}
 }
 /* ── 实时监视器：每秒采样 + Canvas 迷你曲线 ── */
 const hist = {down: [], up: []};
@@ -610,8 +758,8 @@ async function importCookies(){
     toast('Cookie 已导入'); $('cookie-string').value=''; refreshSession(); }catch(e){ toast(e.message);}
 }
 async function checkSession(){
-  try{ const s = await api('/api/session?check=1');
-    $('session-check').textContent = s.ok? '✓ 会话可用' : '✗ '+(s.reason||'不可用'); refreshSession(); }catch(e){ toast(e.message);}
+  try{ const s = await withStatus('正在测试站点可用性…', () => api('/api/session?check=1'));
+    $('session-check').textContent = s.ok? '✓ 会话可用' : '✗ '+(s.reason||'不可用'); refreshSession(); }catch(e){}
 }
 async function clearSession(){ await api('/api/session', {method:'DELETE'}); refreshSession(); toast('Cookie 已清除'); }
 const switchState = {downloads_paused: false, seeds_paused: false};

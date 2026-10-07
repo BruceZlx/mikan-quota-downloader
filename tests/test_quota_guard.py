@@ -85,28 +85,32 @@ class FakeEngine(Engine):
         for t in self.torrents:
             if t.state == TaskState.DOWNLOADING:
                 t.state = TaskState.PAUSED
+                t.held = True
                 self._dl_held.add(t.sha)
 
     def resume_downloads(self):
         self.downloads_paused = False
-        for t in self.torrents:
-            if t.state == TaskState.PAUSED and t.sha not in self._seed_held:
-                t.state = TaskState.DOWNLOADING
-                self._dl_held.discard(t.sha)
+        for sha in list(self._dl_held):
+            self._dl_held.discard(sha)
+            if sha in self._seed_held:
+                continue  # 仍被做种开关按住
+            self._set(sha, state=TaskState.DOWNLOADING, held=False)
 
     def pause_seeds(self):
         self.seeds_paused = True
         for t in self.torrents:
             if t.state == TaskState.SEEDING:
                 t.state = TaskState.PAUSED
+                t.held = True
                 self._seed_held.add(t.sha)
 
     def resume_seeds(self):
         self.seeds_paused = False
-        for t in self.torrents:
-            if t.state == TaskState.PAUSED and t.sha in self._seed_held:
-                t.state = TaskState.SEEDING
-                self._seed_held.discard(t.sha)
+        for sha in list(self._seed_held):
+            self._seed_held.discard(sha)
+            if sha in self._dl_held:
+                continue  # 仍被下载开关按住
+            self._set(sha, state=TaskState.SEEDING, held=False)
 
     def pause(self, sha):
         self._require(sha)
@@ -114,6 +118,8 @@ class FakeEngine(Engine):
 
     def resume(self, sha):
         self._require(sha)
+        if sha in self._dl_held or sha in self._seed_held:
+            return  # 被总开关按住：恢复无效
         self.resumed.append(sha)
         self._set(sha, state=TaskState.DOWNLOADING)
 
@@ -301,6 +307,43 @@ class QuotaGuardTest(unittest.TestCase):
         snap = self.guard.snapshot()
         self.assertEqual(snap.active_remaining, 0)
         self.assertEqual(snap.remaining, 100)
+
+    def test_drain_skips_tasks_held_by_switches(self):
+        """被下载/做种总开关按住的任务：限额放行不得绕过开关。"""
+        self.guard.admit(make_torrent(80, b"a1"), save_path="/x")
+        self.guard.admit(make_torrent(45, b"a2"), save_path="/x")  # 预算不足，排队
+        t1, t2 = self.engine.torrents
+        t1.downloaded, t1.done, t1.state = 80, 80, TaskState.SEEDING  # 下载完成转做种
+        self.guard.snapshot()  # 先把 a1 的 80 字节记入当日账目
+
+        self.engine.pause_seeds()  # 做种开关按住正在做种的 t1
+        with mock.patch("server.services.quota_guard.time") as fake_time:
+            fake_time.strftime.return_value = "2099-01-01"  # 次日：预算充足，a2 可放行
+            resumed = self.guard.drain()
+        self.assertNotIn(t1.sha, resumed)
+        self.assertEqual(t1.state, TaskState.PAUSED)  # 仍被按住
+        self.assertIn(t2.sha, resumed)  # 未被按住的排队任务正常放行
+
+    def test_drain_frozen_while_downloads_switch_paused(self):
+        """下载总开关暂停中：等待队列整体冻结，一个都不放行。"""
+        self.guard.paused_provider = lambda: (True, False)
+        self.guard.admit(make_torrent(80, b"a1"), save_path="/x")
+        self.guard.admit(make_torrent(45, b"a2"), save_path="/x")  # 预算不足，排队
+        t1, t2 = self.engine.torrents
+        t1.downloaded, t1.done, t1.state = 80, 80, TaskState.COMPLETED
+        self.guard.snapshot()  # 当日入账
+
+        with mock.patch("server.services.quota_guard.time") as fake_time:
+            fake_time.strftime.return_value = "2099-01-01"
+            self.assertEqual(self.guard.drain(), [])  # 冻结：次日也不放行
+            self.assertEqual(t2.state, TaskState.PAUSED)
+
+        # 放开开关后立即恢复放行
+        self.guard.paused_provider = lambda: (False, False)
+        with mock.patch("server.services.quota_guard.time") as fake_time:
+            fake_time.strftime.return_value = "2099-01-01"
+            self.assertEqual(self.guard.drain(), [t2.sha])
+        self.assertEqual(t2.state, TaskState.DOWNLOADING)
 
 
 if __name__ == "__main__":

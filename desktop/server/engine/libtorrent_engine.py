@@ -112,6 +112,9 @@ class LibtorrentEngine(Engine):
 
     def _insert(self, atp, ti, sha: str, *, paused: bool, save_path: str, sequential: bool):
         atp.save_path = save_path or self._default_save_path
+        if not paused and self._downloads_paused:
+            paused = True  # 下载总开关开着：新任务直接进入被按住的暂停态
+            self._dl_held.add(sha)
         flags = atp.flags
         flags |= lt.torrent_flags.paused if paused else lt.torrent_flags.auto_managed
         if sequential:
@@ -132,6 +135,7 @@ class LibtorrentEngine(Engine):
                 save_path=atp.save_path,
                 added_at=time.time(),
                 order=self._next_seq,
+                held=sha in self._dl_held or sha in self._seed_held,
             )
 
     def move_storage(self, sha: str, new_path: str):
@@ -189,6 +193,8 @@ class LibtorrentEngine(Engine):
         handle.pause()
 
     def resume(self, sha: str):
+        if sha in self._dl_held or sha in self._seed_held:
+            return  # 被下载/做种总开关按住：限额放行、手动恢复都无效，先放开总开关
         handle = self._find(sha)
         handle.set_flags(lt.torrent_flags.auto_managed)
         handle.resume()
@@ -282,6 +288,25 @@ class LibtorrentEngine(Engine):
             else:
                 state = TaskState.DOWNLOADING
 
+            # 总开关持续强制：开关开着时，新进入对应状态的任务（新入队/下载完成转做种）
+            # 自动暂停并记录归属，直到开关放开——这是"暂停后仍在继续"的根治点
+            if self._downloads_paused and state == TaskState.DOWNLOADING and sha not in self._dl_held:
+                try:
+                    handle.unset_flags(lt.torrent_flags.auto_managed)
+                    handle.pause()
+                except Exception:
+                    pass
+                self._dl_held.add(sha)
+                state = TaskState.PAUSED
+            if self._seeds_paused and state == TaskState.SEEDING and sha not in self._seed_held:
+                try:
+                    handle.unset_flags(lt.torrent_flags.auto_managed)
+                    handle.pause()
+                except Exception:
+                    pass
+                self._seed_held.add(sha)
+                state = TaskState.PAUSED
+
             prev = self._states.get(sha)
             self._states[sha] = TorrentState(
                 sha=sha,
@@ -298,6 +323,7 @@ class LibtorrentEngine(Engine):
                 save_path=st.save_path or (prev.save_path if prev else self._default_save_path),
                 added_at=prev.added_at if prev else time.time(),
                 order=prev.order if prev else self._bump_seq(),
+                held=sha in self._dl_held or sha in self._seed_held,
                 error=error,
             )
         for sha in [s for s in self._states if s not in seen]:  # 引擎外部移除的任务

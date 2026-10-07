@@ -264,14 +264,38 @@ class Store:
 
     # ---- 订阅集数追踪（下载完成才算「已见」，中途丢失会自动补拉） ----
 
-    def episode_add(self, sub_id: int, guid: str, sha: str, title: str = ""):
+    def episode_add(self, sub_id: int, guid: str, sha: str, title: str = "", state: str = "added"):
         with self._lock:
             self.conn.execute(
                 "INSERT OR IGNORE INTO sub_episodes(sub_id, guid, sha, title, state, added_at) "
-                "VALUES (?,?,?,?, 'added', ?)",
-                (sub_id, guid, sha, title, time.time()),
+                "VALUES (?,?,?,?,?,?)",
+                (sub_id, guid, sha, title, state, time.time()),
             )
             self.conn.commit()
+
+    def episode_get(self, episode_id: int):
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM sub_episodes WHERE id=?", (episode_id,)
+            ).fetchone()
+            return dict(row) if row is not None else None
+
+    def episode_set_state(self, episode_id: int, state: str):
+        with self._lock:
+            self.conn.execute(
+                "UPDATE sub_episodes SET state=? WHERE id=?", (state, episode_id)
+            )
+            self.conn.commit()
+
+    def episodes_pending(self):
+        """全部待确认集数（跨订阅，按加入时间正序），供「待确认」卡片渲染。"""
+        with self._lock:
+            return [
+                dict(r)
+                for r in self.conn.execute(
+                    "SELECT * FROM sub_episodes WHERE state='pending' ORDER BY added_at, id"
+                ).fetchall()
+            ]
 
     def episode_exists(self, guid: str) -> bool:
         with self._lock:

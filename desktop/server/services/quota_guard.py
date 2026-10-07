@@ -52,12 +52,15 @@ class QuotaGuard:
         download_quota: DailyQuota | None = None,
         seed_limit_bytes: int = 0,
         user_upload_bps: int | None = None,
+        paused_provider=None,
     ):
         self.engine = engine
         self.store = store
         self.quota = download_quota or DailyQuota(30 * GiB)
         self.seed_limit = int(seed_limit_bytes or 0)
         self.user_upload_bps = user_upload_bps  # 用户在设置页配置的上传限速；None=不限
+        # () -> (downloads_paused, seeds_paused)：总开关状态，drain 放行前必须尊重
+        self.paused_provider = paused_provider
 
     def snapshot(self) -> QuotaSnapshot:
         """从引擎取任务状态，归集今日下载/上传量并计算在途剩余。"""
@@ -97,14 +100,26 @@ class QuotaGuard:
         self.engine.add(raw, paused=not decision.start, save_path=save_path, sequential=sequential)
         return decision
 
+    def _switches_paused(self) -> tuple[bool, bool]:
+        if self.paused_provider is None:
+            return False, False
+        try:
+            downloads_paused, seeds_paused = self.paused_provider()
+            return bool(downloads_paused), bool(seeds_paused)
+        except Exception:
+            return False, False
+
     def drain(self) -> list[str]:
         """下载预算允许时按加入先后放行等待队列（小任务可插空），返回恢复的任务 sha。
 
-        先执行「超预算强制排队」：磁力链接等元数据后置的任务在体积已知后，
-        若尚未消耗流量且体积超出剩余预算，则暂停转入等待队列（次日预算恢复后放行）。
+        - 下载总开关开着时不放行任何任务（做种开关只影响做种，与此无关）；
+        - 被总开关按住的任务（held）跳过——恢复它们的唯一方式是放开总开关；
+        - 先执行「超预算强制排队」：磁力链接等元数据后置的任务在体积已知后，
+          若尚未消耗流量且体积超出剩余预算，则暂停转入等待队列（次日预算恢复后放行）。
         """
         snap = self.snapshot()
         used, active_remaining = snap.used_download, snap.active_remaining
+        downloads_paused, _seeds_paused = self._switches_paused()
 
         for t in list(self.engine.list()):
             if t.state != TaskState.DOWNLOADING or t.size <= 0 or t.downloaded > 0:
@@ -116,8 +131,14 @@ class QuotaGuard:
                 active_remaining -= need
 
         resumed = []
+        if downloads_paused:
+            return resumed  # 总开关暂停中：等待队列整体冻结（引擎侧任务也都被按住）
         waiting = sorted(
-            (t for t in self.engine.list() if t.state == TaskState.PAUSED),
+            (
+                t
+                for t in self.engine.list()
+                if t.state == TaskState.PAUSED and not t.held
+            ),
             key=lambda t: (t.added_at, t.order),
         )
         for t in waiting:

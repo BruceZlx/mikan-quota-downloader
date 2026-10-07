@@ -37,6 +37,36 @@ def check_all(request: Request):
     return request.app.state.ctx.subs.check_all()
 
 
+@router.get("/pending")
+def list_pending(request: Request):
+    """待确认的新集（逐集确认模式开启时，订阅新集先进入这里等放行）。"""
+    ctx = request.app.state.ctx
+    return {"pending": ctx.subs.pending_list(), "confirm_enabled": ctx.confirm_new_episodes}
+
+
+@router.post("/pending/approve-all")
+def approve_all_pending(request: Request):
+    return request.app.state.ctx.subs.approve_all()
+
+
+@router.post("/pending/{episode_id}/approve")
+def approve_pending(episode_id: int, request: Request):
+    ctx = request.app.state.ctx
+    try:
+        return ctx.subs.approve(episode_id)
+    except SubscriptionError as exc:
+        raise HTTPException(404 if "不存在" in str(exc) else 422, str(exc))
+
+
+@router.post("/pending/{episode_id}/reject")
+def reject_pending(episode_id: int, request: Request):
+    ctx = request.app.state.ctx
+    try:
+        return ctx.subs.reject(episode_id)
+    except SubscriptionError as exc:
+        raise HTTPException(404 if "不存在" in str(exc) else 422, str(exc))
+
+
 @router.post("/organize")
 def organize(request: Request, payload: dict | None = None):
     """整理订阅与已下载动画：补全番剧名/目录，文件搬进各番剧文件夹。

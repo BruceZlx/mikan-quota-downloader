@@ -26,7 +26,13 @@ def list_tasks(request: Request):
         tasks = ctx.engine.list()
     except Exception as exc:
         raise HTTPException(503, f"引擎不可达：{exc}")
-    return [_serialize(t) for t in tasks]
+    # sha → 订阅（供 UI 把任务按订阅分组折叠展示）；手动添加的任务不在映射里
+    subs: dict = {}
+    for sub in ctx.store.sub_list(deleted=None):
+        for ep in ctx.store.episodes_all(sub["id"]):
+            if ep["sha"]:
+                subs[ep["sha"]] = {"sub_id": sub["id"], "title": sub["title"] or sub["rss_url"]}
+    return {"tasks": [_serialize(t) for t in tasks], "subs": subs}
 
 
 @router.post("/tasks/add")

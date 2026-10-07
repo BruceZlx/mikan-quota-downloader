@@ -38,3 +38,5 @@ desktop:
   bind_ip: ""
   # BT 监听端口（仅 libtorrent 引擎）
   bt_port: 6881
+  # 订阅新集下载前需逐集确认（主页「待确认新集」放行）；false=发现即自动下载
+  confirm_new_episodes: true

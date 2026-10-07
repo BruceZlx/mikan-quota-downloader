@@ -23,8 +23,20 @@ def get_settings(request: Request):
         "download_limit_gb": ctx.guard.quota.limit / GiB,
         "seed_limit_gb": ctx.guard.seed_limit / GiB,
         "interval_minutes": int(ctx.cfg.setdefault("monitor", {}).get("interval_minutes", 20)),
+        "confirm_new_episodes": bool(getattr(ctx, "confirm_new_episodes", True)),
         "config_persist": bool(ctx.config_store is not None and ctx.config_store.path),
     }
+
+
+@router.post("/confirm-episodes")
+def set_confirm_episodes(request: Request, payload: dict):
+    """逐集确认开关：开启后订阅发现的新集先进「待确认」，用户放行才开始下载。
+
+    立即生效并回写 config.yaml；已处于 pending 的集数不受影响。
+    """
+    ctx = request.app.state.ctx
+    ctx.set_confirm_new_episodes(bool(payload.get("enabled")))
+    return {"ok": True, "confirm_new_episodes": ctx.confirm_new_episodes}
 
 
 @router.post("/interval")

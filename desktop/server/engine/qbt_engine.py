@@ -32,6 +32,11 @@ class QbtWebuiEngine(Engine):
         self._bind_ip = bind_ip
         self._paused = paused  # 登录后立即应用全局暂停
         self.session = requests.Session()
+        # 下载/做种总开关各自按住的任务：开关放开前，限额放行/手动恢复都无效
+        self._dl_held: set[str] = set()
+        self._seed_held: set[str] = set()
+        self._downloads_paused_flag = False
+        self._seeds_paused_flag = False
 
     # ---- 生命周期 ----
 
@@ -116,6 +121,8 @@ class QbtWebuiEngine(Engine):
         self._post_compat("torrents/pause", "torrents/stop", sha=sha)
 
     def resume(self, sha: str):
+        if sha in self._dl_held or sha in self._seed_held:
+            return  # 被总开关按住：不允许单独恢复
         self._post_compat("torrents/resume", "torrents/start", sha=sha)
 
     def pause_all(self):
@@ -127,28 +134,77 @@ class QbtWebuiEngine(Engine):
         self.resume_seeds()
 
     def pause_downloads(self):
-        """下载开关·开：暂停所有正在下载的任务。"""
-        self.pause_matching(
-            lambda t: t.state == TaskState.DOWNLOADING, "torrents/pause")
+        """下载开关·开：暂停所有正在下载的任务（list 内的强制逻辑会按住它们）。"""
+        self._downloads_paused_flag = True
+        self.list()
 
     def resume_downloads(self):
-        """下载开关·关：恢复所有处于暂停的下载任务。"""
-        self.resume_matching(
-            lambda t: t.state == TaskState.PAUSED
-            and float(t.size) > 0 and float(t.done) < float(t.size),
-            "torrents/resume")
+        """下载开关·关：只恢复由下载开关按住的任务。"""
+        self._downloads_paused_flag = False
+        self._downloads_release()
 
     def pause_seeds(self):
-        """做种开关·开：暂停所有正在做种/上传的任务。"""
-        self.pause_matching(
-            lambda t: t.state == TaskState.SEEDING, "torrents/pause")
+        """做种开关·开：暂停所有正在做种/上传的任务（list 内的强制逻辑会按住它们）。"""
+        self._seeds_paused_flag = True
+        self.list()
 
     def resume_seeds(self):
-        """做种开关·关：恢复所有处于暂停的做种任务。"""
-        self.resume_matching(
-            lambda t: t.state == TaskState.PAUSED
-            and float(t.size) > 0 and float(t.done) >= float(t.size),
-            "torrents/resume")
+        """做种开关·关：只恢复由做种开关按住的任务。"""
+        self._seeds_paused_flag = False
+        self._seeds_release()
+
+    def _downloads_release(self):
+        for sha in list(self._dl_held):
+            self._dl_held.discard(sha)
+            if sha in self._seed_held:
+                continue  # 仍被做种开关按住
+            try:
+                self.resume(sha)
+            except EngineError:
+                pass
+
+    def _seeds_release(self):
+        for sha in list(self._seed_held):
+            self._seed_held.discard(sha)
+            if sha in self._dl_held:
+                continue  # 仍被下载开关按住
+            try:
+                self.resume(sha)
+            except EngineError:
+                pass
+
+    def _enforce_switches(self, tasks):
+        """总开关持续强制：新进入对应状态的任务（新入队/下载完成转做种）自动按住。
+
+        作用于已取回的任务快照，暂停走直连端点——不得再调 list()（会无限递归）。
+        """
+        to_pause = [
+            t.sha for t in tasks
+            if (self._downloads_paused_flag and t.state == TaskState.DOWNLOADING
+                and t.sha not in self._dl_held)
+            or (self._seeds_paused_flag and t.state == TaskState.SEEDING
+                and t.sha not in self._seed_held)
+        ]
+        if not to_pause:
+            return
+        for path in ("torrents/pause", "torrents/stop"):
+            try:
+                resp = self.session.post(
+                    f"{self.base}/api/v2/{path}",
+                    data={"hashes": "|".join(to_pause)}, timeout=15,
+                )
+                if resp.status_code == 200:
+                    break
+            except requests.RequestException:
+                return
+        for t in tasks:
+            if t.sha in to_pause:
+                if self._downloads_paused_flag and t.state == TaskState.DOWNLOADING:
+                    self._dl_held.add(t.sha)
+                elif self._seeds_paused_flag and t.state == TaskState.SEEDING:
+                    self._seed_held.add(t.sha)
+                t.state = TaskState.PAUSED
+                t.held = True
 
     def pause_matching(self, predicate, endpoint):
         shas = [t.sha for t in self.list() if predicate(t)]
@@ -175,6 +231,7 @@ class QbtWebuiEngine(Engine):
         resp.raise_for_status()
         tasks = []
         for t in resp.json():
+            sha = str(t.get("hash", ""))
             raw_state = str(t.get("state", ""))
             if raw_state in _FAILED_STATES:
                 state = TaskState.FAILED
@@ -189,7 +246,7 @@ class QbtWebuiEngine(Engine):
             eta = int(t.get("eta", _ETA_UNKNOWN))
             tasks.append(
                 TorrentState(
-                    sha=str(t.get("hash", "")),
+                    sha=sha,
                     name=str(t.get("name", "")),
                     state=state,
                     size=int(t.get("size", 0)),
@@ -202,9 +259,11 @@ class QbtWebuiEngine(Engine):
                     sequential=bool(t.get("seq_dl", False)),
                     save_path=str(t.get("save_path", "")),
                     added_at=float(t.get("added_on", 0) or 0),
+                    held=sha in self._dl_held or sha in self._seed_held,
                     error=raw_state if state == TaskState.FAILED else None,
                 )
             )
+        self._enforce_switches(tasks)  # 总开关开着时按住新进入对应状态的任务
         tasks.sort(key=lambda t: t.added_at)
         return tasks
 

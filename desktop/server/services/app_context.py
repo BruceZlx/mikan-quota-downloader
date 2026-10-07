@@ -35,6 +35,7 @@ class AppContext:
     mirrors: MirrorService | None = None  # Mikan 镜像/副站域名管理
     downloads_paused: bool = False  # 下载开关：暂停所有正在下载的任务（重启保持）
     seeds_paused: bool = False  # 做种开关：暂停所有做种/上传任务（重启保持）
+    confirm_new_episodes: bool = True  # 新集下载前需逐集确认（设置页可关）
 
     def set_downloads_paused(self, value: bool):
         from ..engine.base import EngineError
@@ -63,6 +64,11 @@ class AppContext:
             pass
         if self.config_store is not None:
             self.config_store.update("desktop", {"seeds_paused": self.seeds_paused})
+
+    def set_confirm_new_episodes(self, value: bool):
+        self.confirm_new_episodes = bool(value)
+        if self.config_store is not None:
+            self.config_store.update("desktop", {"confirm_new_episodes": self.confirm_new_episodes})
 
     def start(self):
         self.engine.start()
@@ -125,10 +131,14 @@ def build_context(cfg: dict, config_path: str | None = None) -> AppContext:
         mirrors=mirrors,
         downloads_paused=bool(desktop_cfg.get("downloads_paused")),
         seeds_paused=bool(desktop_cfg.get("seeds_paused")),
+        confirm_new_episodes=bool(desktop_cfg.get("confirm_new_episodes", True)),
     )
+    # 总开关状态供限额放行判断：暂停期间等待队列整体冻结
+    guard.paused_provider = lambda: (ctx.downloads_paused, ctx.seeds_paused)
     ctx.subs = SubscriptionService(
         store, guard, mikan, save_path_provider=lambda: ctx.default_save_path,
         torrent_dir=torrent_dir, mirrors=ctx.mirrors,
+        confirm_provider=lambda: ctx.confirm_new_episodes,
     )
     ctx.subs.migrate_legacy_urls()  # 旧订阅的完整 URL 改写为域名无关路径
     try:

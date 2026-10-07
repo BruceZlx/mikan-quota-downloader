@@ -40,13 +40,16 @@ class SubscriptionError(RuntimeError):
 
 
 class SubscriptionService:
-    def __init__(self, store, guard, mikan, save_path_provider, torrent_dir="data/torrents", mirrors=None):
+    def __init__(self, store, guard, mikan, save_path_provider, torrent_dir="data/torrents", mirrors=None,
+                 confirm_provider=None):
         self.store = store
         self.guard = guard
         self.mikan = mikan
         self.save_path_provider = save_path_provider  # () -> 全局默认下载目录
         self.torrent_dir = torrent_dir  # .torrent 存档目录（断点补拉用）
         self.mirrors = mirrors  # MirrorService；None=不做镜像故障转移（旧测试路径）
+        # () -> bool：新集是否需要逐集确认后才下载（False=发现即下载）
+        self.confirm_provider = confirm_provider
 
     # ---- 管理 ----
 
@@ -200,6 +203,7 @@ class SubscriptionService:
             "total": len(episodes),
             "started": 0,
             "queued": 0,
+            "pending": 0,
             "errors": [],
         }
         self._download_new(
@@ -241,7 +245,7 @@ class SubscriptionService:
         if sub["deleted_at"]:
             raise SubscriptionError("订阅已删除（可在订阅页的「已删除」列表恢复）")
         summary = {"id": sub_id, "title": sub["title"], "started": 0, "queued": 0,
-                   "restored": 0, "errors": []}
+                   "pending": 0, "restored": 0, "errors": []}
         try:
             feed_title, episodes, host = self._fetch_feed_failover(
                 sub["rss_url"], sub.get("mirror_host") or ""
@@ -401,6 +405,67 @@ class SubscriptionService:
     def reconcile(self, sub: dict) -> int:
         return self._restore_missing(sub)
 
+    # ---- 新集逐集确认（confirm_provider 开启时，新集先进 pending 待用户放行） ----
+
+    def pending_list(self) -> list[dict]:
+        """待确认集数（附订阅名），供 UI 的「待确认」卡片渲染。"""
+        items = []
+        for ep in self.store.episodes_pending():
+            sub = self.store.sub_get(ep["sub_id"])
+            items.append({
+                **ep,
+                "sub_title": (sub or {}).get("title") or (sub or {}).get("rss_url") or "",
+            })
+        return items
+
+    def approve(self, episode_id: int) -> dict:
+        """放行待确认集数：从本地种子存档入队（受当日限额约束，装不下自动排队）。"""
+        ep = self.store.episode_get(episode_id)
+        if ep is None:
+            raise SubscriptionError(f"集数不存在: {episode_id}")
+        if ep["state"] != "pending":
+            raise SubscriptionError(f"集数不在待确认状态（当前 {ep['state']}）")
+        sub = self.store.sub_get(ep["sub_id"])
+        target = (sub or {}).get("save_path") or self.save_path_provider()
+        if not target:
+            raise SubscriptionError("未指定下载目录：请先在设置中保存默认下载目录")
+        archive = Path(self.torrent_dir) / f"{ep['sha']}.torrent"
+        try:
+            raw = archive.read_bytes()
+        except OSError as exc:
+            raise SubscriptionError(f"种子存档缺失（{archive.name}），可等下一轮检查自动重试") from exc
+        try:
+            decision = self.guard.admit(raw, save_path=target)
+        except EngineError as exc:
+            raise SubscriptionError(str(exc)) from exc
+        self.store.episode_set_state(episode_id, "added")
+        self.store.mark_seen(ep["guid"], title=ep["title"], added_at=time.time())
+        return {"id": episode_id, "title": ep["title"], "started": decision.start,
+                "reason": decision.reason}
+
+    def reject(self, episode_id: int) -> dict:
+        """拒绝待确认集数：不再提示也不再下载（本轮 RSS 也不会再次出现）。"""
+        ep = self.store.episode_get(episode_id)
+        if ep is None:
+            raise SubscriptionError(f"集数不存在: {episode_id}")
+        self.store.episode_set_state(episode_id, "rejected")
+        try:  # 存档一并清掉，避免留下从未同意下载的种子
+            (Path(self.torrent_dir) / f"{ep['sha']}.torrent").unlink()
+        except OSError:
+            pass
+        return {"id": episode_id, "title": ep["title"], "rejected": True}
+
+    def approve_all(self) -> dict:
+        summary = {"approved": 0, "failed": 0, "errors": []}
+        for ep in self.store.episodes_pending():
+            try:
+                self.approve(ep["id"])
+                summary["approved"] += 1
+            except SubscriptionError as exc:
+                summary["failed"] += 1
+                summary["errors"].append(f"{ep['title']}: {exc}")
+        return summary
+
     # ---- 内部：恢复与下载 ----
 
     def _restore_missing(self, sub: dict, by_guid=None) -> int:
@@ -408,12 +473,13 @@ class SubscriptionService:
 
         - 未完成（added）：续传下载；
         - 已完成（done）：重新入队做种（重启后做种恢复）；
-        - 封存（sealed，用户在任务列表删除过）：永不恢复。
+        - 封存（sealed，用户在任务列表删除过）与拒绝（rejected）永不恢复；
+        - 待确认（pending）：等用户放行，不自动下载。
         """
         restored = 0
         tasks_by_sha = {t.sha: t for t in self.guard.engine.list()}
         for ep in self.store.episodes_all(sub["id"]):
-            if ep["state"] == "sealed":
+            if ep["state"] in ("sealed", "rejected", "pending"):
                 continue
             task = tasks_by_sha.get(ep["sha"])
             if task is not None:
@@ -462,8 +528,14 @@ class SubscriptionService:
         for ep in sorted(fresh, key=lambda e: e.published):
             try:
                 raw = self._download_with_failover(ep, preferred_host=preferred_host)
-                decision = self.guard.admit(raw, save_path=target)
                 sha = infohash_from_bytes(raw)
+                if self.confirm_provider is not None and self.confirm_provider():
+                    # 逐集确认模式：种子先行存档，任务等用户在「待确认」卡片放行
+                    self.store.episode_add(sub_id, ep.guid, sha, ep.title, state="pending")
+                    self._save_torrent(sha, raw)
+                    summary["pending"] = summary.get("pending", 0) + 1
+                    continue
+                decision = self.guard.admit(raw, save_path=target)
                 self.store.episode_add(sub_id, ep.guid, sha, ep.title)
                 self._save_torrent(sha, raw)  # 本地存档，供任务丢失后补拉
                 summary["started" if decision.start else "queued"] += 1

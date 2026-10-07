@@ -82,9 +82,10 @@ class SystemApiTest(ApiTestBase):
 class TasksApiTest(ApiTestBase):
     def test_list_add_pause_resume_remove(self):
         sha = self.engine.add(make_torrent(40, b"a1"), paused=False, save_path="/x")
-        tasks = self.client.get("/api/tasks").json()
-        self.assertEqual([t["sha"] for t in tasks], [sha])
-        self.assertEqual(tasks[0]["state"], "downloading")
+        data = self.client.get("/api/tasks").json()
+        self.assertEqual([t["sha"] for t in data["tasks"]], [sha])
+        self.assertEqual(data["tasks"][0]["state"], "downloading")
+        self.assertEqual(data["subs"], {})  # 手动添加的任务没有订阅归属
 
         self.client.post(f"/api/tasks/{sha}/pause")
         self.assertEqual(self.engine.list()[0].state.value, "paused")
@@ -93,7 +94,18 @@ class TasksApiTest(ApiTestBase):
         self.assertEqual(self.engine.list()[0].state.value, "downloading")
 
         self.client.delete(f"/api/tasks/{sha}")
-        self.assertEqual(self.client.get("/api/tasks").json(), [])
+        self.assertEqual(self.client.get("/api/tasks").json()["tasks"], [])
+
+    def test_tasks_carry_subscription_mapping(self):
+        self.ctx.default_save_path = "/dl"
+        url = "https://mikan.example/RSS/Bangumi?bangumiId=1&subgroupid=2"
+        self.mikan.set_feed(url, "某番", [make_episode("g1", "第01集", 1.0)])
+        self.client.post("/api/subscriptions", json={"rss_url": url})
+        data = self.client.get("/api/tasks").json()
+        self.assertEqual(len(data["subs"]), 1)
+        sub_info = next(iter(data["subs"].values()))
+        self.assertEqual(sub_info["title"], "某番")
+        self.assertEqual(data["tasks"][0]["sha"], next(iter(data["subs"])))
 
     def test_operate_missing_task_returns_404(self):
         self.assertEqual(self.client.post("/api/tasks/deadbeef/pause").status_code, 404)
@@ -243,6 +255,78 @@ class SubscriptionsApiTest(ApiTestBase):
         self.assertEqual(
             self.client.post("/api/settings/interval", json={"minutes": 0}).status_code, 422
         )
+
+
+class PendingEpisodesApiTest(ApiTestBase):
+    """逐集确认：新集先进 pending，放行才下载，拒绝不再出现。"""
+
+    URL = "https://mikan.example/RSS/Bangumi?bangumiId=3992&subgroupid=370"
+
+    def setUp(self):
+        super().setUp()
+        self.ctx.default_save_path = "/dl"
+        self.ctx.confirm_new_episodes = True
+        self.ctx.subs = SubscriptionService(
+            self.ctx.guard.store, self.ctx.guard, self.mikan,
+            lambda: self.ctx.default_save_path,
+            torrent_dir=f"{self.tmp}/torrents", mirrors=self.mirrors,
+            confirm_provider=lambda: self.ctx.confirm_new_episodes,
+        )
+        self.mikan.set_feed(
+            self.URL, "某番", [make_episode("g1", "第01集", 1.0), make_episode("g2", "第02集", 2.0)]
+        )
+
+    def test_add_marks_pending_without_downloading(self):
+        data = self.client.post("/api/subscriptions", json={"rss_url": self.URL}).json()
+        self.assertEqual(data["pending"], 2)
+        self.assertEqual(data["started"], 0)
+        self.assertEqual(self.engine.list(), [])  # 引擎里没有任务
+
+        listing = self.client.get("/api/subscriptions/pending").json()
+        self.assertTrue(listing["confirm_enabled"])
+        titles = {p["title"] for p in listing["pending"]}
+        self.assertEqual(titles, {"第01集", "第02集"})
+        self.assertTrue(all(p["sub_title"] == "某番" for p in listing["pending"]))
+
+    def test_approve_downloads_and_reject_hides(self):
+        self.client.post("/api/subscriptions", json={"rss_url": self.URL})
+        pending = self.client.get("/api/subscriptions/pending").json()["pending"]
+        first, second = pending[0], pending[1]
+
+        approved = self.client.post(f"/api/subscriptions/pending/{first['id']}/approve").json()
+        self.assertTrue(approved["started"])
+        self.assertEqual(len(self.engine.list()), 1)
+        # 放行一集后，待确认列表只剩另一集
+        self.assertEqual(
+            [p["id"] for p in self.client.get("/api/subscriptions/pending").json()["pending"]],
+            [second["id"]],
+        )
+
+        self.client.post(f"/api/subscriptions/pending/{second['id']}/reject")
+        self.assertEqual(self.client.get("/api/subscriptions/pending").json()["pending"], [])
+        # 拒绝的集数下轮检查不会再次出现（guid 已在追踪表）
+        result = self.client.post("/api/subscriptions/check-all").json()
+        self.assertEqual(result["started"], 0)
+
+    def test_approve_all_and_toggle_off(self):
+        self.client.post("/api/subscriptions", json={"rss_url": self.URL})
+        summary = self.client.post("/api/subscriptions/pending/approve-all").json()
+        self.assertEqual(summary["approved"], 2)
+        self.assertEqual(len(self.engine.list()), 2)
+        self.assertEqual(self.client.get("/api/subscriptions/pending").json()["pending"], [])
+
+        # 关闭确认开关后：新集直接下载
+        self.ctx.confirm_new_episodes = False
+        self.mikan.set_feed(
+            self.URL, "某番", [make_episode("g3", "第03集", 3.0)]
+        )
+        result = self.client.post("/api/subscriptions/check-all").json()
+        self.assertEqual(result["started"], 1)
+
+    def test_settings_roundtrip(self):
+        self.assertTrue(self.client.get("/api/settings").json()["confirm_new_episodes"])
+        self.client.post("/api/settings/confirm-episodes", json={"enabled": False})
+        self.assertFalse(self.client.get("/api/settings").json()["confirm_new_episodes"])
 
 
 class MirrorsApiTest(ApiTestBase):

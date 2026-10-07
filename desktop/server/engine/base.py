@@ -37,6 +37,7 @@ class TorrentState:
     save_path: str = ""
     added_at: float = 0.0  # 入队时间戳（等待队列排序）
     order: int = 0  # 入队序号（同时间戳时的稳定排序）
+    held: bool = False  # 被下载/做种总开关按住：在开关放开前不允许任何方式恢复
     error: str | None = None
 
 
